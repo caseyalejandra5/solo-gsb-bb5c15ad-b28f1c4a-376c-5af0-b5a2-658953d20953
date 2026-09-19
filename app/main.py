@@ -23,6 +23,9 @@ from fastapi.responses import JSONResponse
 
 from .db import DB_LOCK, get_conn, init_db
 from .schemas import (
+    BatchLeaseItem,
+    BatchLeaseRequest,
+    BatchLeaseResponse,
     BlockedChunk,
     ChunkStatus,
     CompleteRequest,
@@ -58,7 +61,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Chunked Upload Coordinator",
     description="断点分片上传协调服务：只管理元数据（会话 / 租约 / 分片摘要），不接收文件内容。",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -87,6 +90,25 @@ def lease_valid(chunk, now: datetime) -> bool:
         chunk["lease_expires_at"] is not None
         and parse_ts(chunk["lease_expires_at"]) > now
     )
+
+
+def count_active_leases(session_id: str, now: datetime) -> int:
+    """统计会话当前有效租约数：未完成且租约未过期。过期租约视为空闲，不计入。"""
+    row = get_conn().execute(
+        "SELECT COUNT(*) AS n FROM chunks"
+        " WHERE session_id = ? AND status != 'completed'"
+        " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+        (session_id, now.isoformat()),
+    ).fetchone()
+    return row["n"]
+
+
+def load_session_chunks(session_id: str) -> list:
+    """按分片序号升序读取会话全部分片。"""
+    return get_conn().execute(
+        "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
+        (session_id,),
+    ).fetchall()
 
 
 def load_dependencies(session_id: str) -> dict[int, list[int]]:
@@ -134,9 +156,11 @@ def create_session(req: CreateSessionRequest):
     with DB_LOCK:
         conn = get_conn()
         conn.execute(
-            "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status, created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?)",
-            (session_id, req.total_chunks, req.file_digest, req.digest_algorithm, now.isoformat()),
+            "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
+            " max_active_leases, created_at)"
+            " VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            (session_id, req.total_chunks, req.file_digest, req.digest_algorithm,
+             req.max_active_leases, now.isoformat()),
         )
         conn.executemany(
             "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
@@ -153,6 +177,7 @@ def create_session(req: CreateSessionRequest):
         file_digest=req.file_digest,
         digest_algorithm=req.digest_algorithm,
         status="active",
+        max_active_leases=req.max_active_leases,
         created_at=now,
     )
 
@@ -164,47 +189,48 @@ def create_session(req: CreateSessionRequest):
     summary="查询会话状态",
 )
 def get_session_status(session_id: str):
-    session = get_session_or_404(session_id)
-    rows = get_conn().execute(
-        "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
-        (session_id,),
-    ).fetchall()
-    deps = load_dependencies(session_id)
     now = utcnow()
+    with DB_LOCK:
+        session = get_session_or_404(session_id)
+        rows = load_session_chunks(session_id)
+        deps = load_dependencies(session_id)
+        active_leases = count_active_leases(session_id, now)
 
-    chunks: list[ChunkStatus] = []
-    missing: list[int] = []
-    for row in rows:
-        status = row["status"]
-        lease_expires_at = parse_ts(row["lease_expires_at"]) if row["lease_expires_at"] else None
-        if status == "leased" and (lease_expires_at is None or lease_expires_at <= now):
-            status = "pending"  # 租约已过期，读时按可领取展示
-            lease_expires_at = None
-        if row["status"] != "completed":
-            missing.append(row["chunk_index"])
-        chunks.append(
-            ChunkStatus(
-                chunk_index=row["chunk_index"],
-                status=status,
-                lease_expires_at=lease_expires_at,
-                chunk_digest=row["chunk_digest"],
-                completed_at=parse_ts(row["completed_at"]) if row["completed_at"] else None,
-                dependencies=deps.get(row["chunk_index"], []),
+        chunks: list[ChunkStatus] = []
+        missing: list[int] = []
+        for row in rows:
+            status = row["status"]
+            lease_expires_at = parse_ts(row["lease_expires_at"]) if row["lease_expires_at"] else None
+            if status == "leased" and (lease_expires_at is None or lease_expires_at <= now):
+                status = "pending"  # 租约已过期，读时按可领取展示
+                lease_expires_at = None
+            if row["status"] != "completed":
+                missing.append(row["chunk_index"])
+            chunks.append(
+                ChunkStatus(
+                    chunk_index=row["chunk_index"],
+                    status=status,
+                    lease_expires_at=lease_expires_at,
+                    chunk_digest=row["chunk_digest"],
+                    completed_at=parse_ts(row["completed_at"]) if row["completed_at"] else None,
+                    dependencies=deps.get(row["chunk_index"], []),
+                )
             )
-        )
 
-    return SessionStatusResponse(
-        id=session["id"],
-        status=session["status"],
-        total_chunks=session["total_chunks"],
-        completed_chunks=session["total_chunks"] - len(missing),
-        missing_chunks=missing,
-        file_digest=session["file_digest"],
-        digest_algorithm=session["digest_algorithm"],
-        created_at=parse_ts(session["created_at"]),
-        finalized_at=parse_ts(session["finalized_at"]) if session["finalized_at"] else None,
-        chunks=chunks,
-    )
+        return SessionStatusResponse(
+            id=session["id"],
+            status=session["status"],
+            total_chunks=session["total_chunks"],
+            completed_chunks=session["total_chunks"] - len(missing),
+            missing_chunks=missing,
+            file_digest=session["file_digest"],
+            digest_algorithm=session["digest_algorithm"],
+            max_active_leases=session["max_active_leases"],
+            active_leases=active_leases,
+            created_at=parse_ts(session["created_at"]),
+            finalized_at=parse_ts(session["finalized_at"]) if session["finalized_at"] else None,
+            chunks=chunks,
+        )
 
 
 # ---------------------------------------------------------------- 就绪查询
@@ -216,29 +242,27 @@ def get_session_status(session_id: str):
     summary="查询当前可领取的分片与被依赖阻塞的分片",
 )
 def get_ready_chunks(session_id: str):
-    get_session_or_404(session_id)
-    rows = get_conn().execute(
-        "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
-        (session_id,),
-    ).fetchall()
-    deps = load_dependencies(session_id)
     now = utcnow()
+    with DB_LOCK:
+        get_session_or_404(session_id)
+        rows = load_session_chunks(session_id)
+        deps = load_dependencies(session_id)
 
-    completed = {r["chunk_index"] for r in rows if r["status"] == "completed"}
-    ready: list[int] = []
-    blocked: list[BlockedChunk] = []
-    for row in rows:
-        chunk_index = row["chunk_index"]
-        if row["status"] == "completed":
-            continue
-        missing_deps = [d for d in deps.get(chunk_index, []) if d not in completed]
-        if missing_deps:
-            blocked.append(
-                BlockedChunk(chunk_index=chunk_index, missing_dependencies=missing_deps)
-            )
-        elif not lease_valid(row, now):
-            # 无租约或租约已过期，且前置已全部完成：立即可领取
-            ready.append(chunk_index)
+        completed = {r["chunk_index"] for r in rows if r["status"] == "completed"}
+        ready: list[int] = []
+        blocked: list[BlockedChunk] = []
+        for row in rows:
+            chunk_index = row["chunk_index"]
+            if row["status"] == "completed":
+                continue
+            missing_deps = [d for d in deps.get(chunk_index, []) if d not in completed]
+            if missing_deps:
+                blocked.append(
+                    BlockedChunk(chunk_index=chunk_index, missing_dependencies=missing_deps)
+                )
+            elif not lease_valid(row, now):
+                # 无租约或租约已过期，且前置已全部完成：立即可领取
+                ready.append(chunk_index)
 
     return ReadyResponse(
         session_id=session_id,
@@ -286,6 +310,17 @@ def claim_lease(
                 missing_dependencies=missing_deps,
             )
 
+        # 会话级并发上限：有效租约数（不含当前分片，因其尚无有效租约）达上限即拒绝
+        max_active = session["max_active_leases"]
+        if max_active is not None:
+            active = count_active_leases(session_id, now)
+            if active >= max_active:
+                return conflict(
+                    "session max_active_leases reached",
+                    active_leases=active,
+                    max_active_leases=max_active,
+                )
+
         token = secrets.token_urlsafe(32)
         expires_at = now + timedelta(seconds=ttl)
         get_conn().execute(
@@ -300,6 +335,96 @@ def claim_lease(
         chunk_index=chunk_index,
         lease_token=token,
         expires_at=expires_at,
+    )
+
+
+@app.post(
+    "/sessions/{session_id}/leases/batch",
+    response_model=BatchLeaseResponse,
+    tags=["leases"],
+    summary="会话级原子批量领取租约（按分片序号升序，受 max_active_leases 约束）",
+)
+def claim_leases_batch(session_id: str, req: BatchLeaseRequest):
+    ttl = DEFAULT_LEASE_TTL_SECONDS
+    if req.lease_ttl_seconds is not None:
+        ttl = min(req.lease_ttl_seconds, MAX_LEASE_TTL_SECONDS)
+
+    now = utcnow()
+    with DB_LOCK:
+        # 资格计算与写入处于同一临界区：并发请求在此串行化，
+        # 既不会把同一片分片分配给多个请求，也不会突破 max_active_leases。
+        session = get_session_or_404(session_id)
+        if session["status"] == "finalized":
+            raise HTTPException(status_code=409, detail="session already finalized")
+
+        rows = load_session_chunks(session_id)
+        deps = load_dependencies(session_id)
+        completed = {r["chunk_index"] for r in rows if r["status"] == "completed"}
+
+        eligible: list[int] = []
+        blocked: list[BlockedChunk] = []
+        # 按分片序号升序扫描，保证领取结果确定且可复现
+        for row in rows:
+            chunk_index = row["chunk_index"]
+            if row["status"] == "completed":
+                continue
+            missing_deps = [d for d in deps.get(chunk_index, []) if d not in completed]
+            if missing_deps:
+                blocked.append(
+                    BlockedChunk(chunk_index=chunk_index, missing_dependencies=missing_deps)
+                )
+            elif not lease_valid(row, now):
+                # 依赖已完成、未完成且无有效租约（过期租约视为空闲）
+                eligible.append(chunk_index)
+
+        max_active = session["max_active_leases"]
+        active_before = count_active_leases(session_id, now)
+        free_slots = (
+            len(eligible)
+            if max_active is None
+            else max(0, max_active - active_before)
+        )
+        granted_indices = eligible[: min(req.count, free_slots)]
+
+        expires_at = now + timedelta(seconds=ttl)
+        granted: list[BatchLeaseItem] = []
+        for chunk_index in granted_indices:
+            token = secrets.token_urlsafe(32)
+            get_conn().execute(
+                "UPDATE chunks SET status = 'leased', lease_token = ?, lease_expires_at = ?"
+                " WHERE session_id = ? AND chunk_index = ?",
+                (token, expires_at.isoformat(), session_id, chunk_index),
+            )
+            granted.append(
+                BatchLeaseItem(
+                    chunk_index=chunk_index,
+                    lease_token=token,
+                    expires_at=expires_at,
+                )
+            )
+        get_conn().commit()
+
+        active_after = active_before + len(granted)
+        # 最早到期时间：覆盖存量有效租约与本次新发放租约
+        next_row = get_conn().execute(
+            "SELECT MIN(lease_expires_at) AS next_expiry FROM chunks"
+            " WHERE session_id = ? AND status != 'completed'"
+            " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+            (session_id, now.isoformat()),
+        ).fetchone()
+        next_expiry = parse_ts(next_row["next_expiry"]) if next_row["next_expiry"] else None
+        remaining = (
+            None if max_active is None else max(0, max_active - active_after)
+        )
+
+    return BatchLeaseResponse(
+        session_id=session_id,
+        leases=granted,
+        granted_count=len(granted),
+        active=active_after,
+        remaining_slots=remaining,
+        blocked_chunks=blocked,
+        next_expiry=next_expiry,
     )
 
 

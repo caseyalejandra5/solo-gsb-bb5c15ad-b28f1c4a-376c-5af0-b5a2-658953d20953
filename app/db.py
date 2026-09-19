@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     file_digest       TEXT NOT NULL,
     digest_algorithm  TEXT NOT NULL DEFAULT 'sha256',
     status            TEXT NOT NULL DEFAULT 'active',   -- active | finalized
+    max_active_leases INTEGER,                          -- 会话级有效租约并发上限，NULL 表示不限制
     created_at        TEXT NOT NULL,
     finalized_at      TEXT
 );
@@ -62,8 +63,17 @@ def get_conn() -> sqlite3.Connection:
         _conn.execute("PRAGMA busy_timeout=5000")
         with DB_LOCK:
             _conn.executescript(SCHEMA)
+            _migrate(_conn)
             _conn.commit()
     return _conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对既有数据库做增量迁移：补齐新增列（新装库无需变更）。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "max_active_leases" not in columns:
+        # 历史会话不限制并发，保持旧行为
+        conn.execute("ALTER TABLE sessions ADD COLUMN max_active_leases INTEGER")
 
 
 def init_db() -> None:

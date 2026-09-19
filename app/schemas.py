@@ -54,6 +54,9 @@ class CreateSessionRequest(BaseModel):
     file_digest: str = Field(min_length=1, max_length=256, description="期望的完整文件摘要")
     digest_algorithm: str = Field(default="sha256", min_length=1, max_length=32,
                                   description="摘要算法标识，仅作记录")
+    max_active_leases: Optional[int] = Field(
+        default=None, ge=1,
+        description="会话级有效租约并发上限：同一时刻最多持有的有效租约数；缺省表示不限制")
     dependencies: Optional[dict[int, list[int]]] = Field(
         default=None,
         description="分片依赖图：键为分片序号，值为该分片领取租约前必须完成的前置分片序号列表；"
@@ -72,6 +75,8 @@ class SessionResponse(BaseModel):
     file_digest: str
     digest_algorithm: str
     status: str
+    max_active_leases: Optional[int] = Field(
+        default=None, description="会话级有效租约并发上限；null 表示不限制")
     created_at: datetime
     finalized_at: Optional[datetime] = None
 
@@ -84,6 +89,21 @@ class LeaseRequest(BaseModel):
 
 class LeaseResponse(BaseModel):
     session_id: str
+    chunk_index: int
+    lease_token: str
+    expires_at: datetime
+
+
+class BatchLeaseRequest(BaseModel):
+    count: int = Field(
+        ge=1, le=100_000,
+        description="期望领取的分片数；实际领取数不超过该值与剩余并发槽位中的较小者")
+    lease_ttl_seconds: Optional[int] = Field(
+        default=None, ge=1,
+        description="租约有效期（秒），缺省取服务端默认值，超过服务端上限会被截断")
+
+
+class BatchLeaseItem(BaseModel):
     chunk_index: int
     lease_token: str
     expires_at: datetime
@@ -134,6 +154,21 @@ class BlockedChunk(BaseModel):
     missing_dependencies: list[int] = Field(description="尚未完成的前置分片（升序）")
 
 
+class BatchLeaseResponse(BaseModel):
+    session_id: str
+    leases: list[BatchLeaseItem] = Field(
+        description="本次原子领取到的租约，按分片序号升序；无可领取项时为空列表")
+    granted_count: int = Field(description="本次实际领取数（len(leases)）")
+    active: int = Field(description="领取完成后当前有效（未过期、未完成）租约数")
+    remaining_slots: Optional[int] = Field(
+        description="剩余并发槽位（max_active_leases - active）；未设置上限时为 null")
+    blocked_chunks: list[BlockedChunk] = Field(
+        default_factory=list,
+        description="被依赖阻塞的分片及各自未完成的前置项（不含已完成与持有效租约的分片）")
+    next_expiry: Optional[datetime] = Field(
+        description="当前最早到期的有效租约时间；无有效租约时为 null")
+
+
 class ReadyResponse(BaseModel):
     session_id: str
     ready_chunks: list[int] = Field(
@@ -150,6 +185,10 @@ class SessionStatusResponse(BaseModel):
     missing_chunks: list[int]
     file_digest: str
     digest_algorithm: str
+    max_active_leases: Optional[int] = Field(
+        default=None, description="会话级有效租约并发上限；null 表示不限制")
+    active_leases: int = Field(
+        description="当前有效（未过期、未完成）租约数，过期租约不计入")
     created_at: datetime
     finalized_at: Optional[datetime] = None
     chunks: list[ChunkStatus]
