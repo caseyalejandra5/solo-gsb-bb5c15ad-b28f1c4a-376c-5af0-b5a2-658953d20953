@@ -23,6 +23,9 @@ from fastapi.responses import JSONResponse
 
 from .db import DB_LOCK, get_conn, init_db
 from .schemas import (
+    BatchLeaseItem,
+    BatchLeaseRequest,
+    BatchLeaseResponse,
     BlockedChunk,
     ChunkStatus,
     CompleteRequest,
@@ -114,6 +117,54 @@ def incomplete_dependencies(session_id: str, chunk_index: int) -> list[int]:
     return [row["depends_on"] for row in rows]
 
 
+def count_active_leases(session_id: str, now: datetime) -> int:
+    """会话内当前有效（未过期）租约数；已完成分片与过期租约均不计入。"""
+    return get_conn().execute(
+        "SELECT COUNT(*) AS n FROM chunks"
+        " WHERE session_id = ? AND status != 'completed'"
+        " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+        (session_id, now.isoformat()),
+    ).fetchone()["n"]
+
+
+def earliest_expiry(session_id: str) -> Optional[datetime]:
+    """会话内当前有效租约中最早的过期时间；无有效租约时返回 None。"""
+    row = get_conn().execute(
+        "SELECT MIN(lease_expires_at) AS earliest FROM chunks"
+        " WHERE session_id = ? AND status != 'completed' AND lease_expires_at IS NOT NULL",
+        (session_id,),
+    ).fetchone()
+    if row is None or row["earliest"] is None:
+        return None
+    expires_at = parse_ts(row["earliest"])
+    return expires_at if expires_at > utcnow() else None
+
+
+def claimable_chunks(session_id: str, now: datetime) -> tuple[list[int], int]:
+    """临界区内调用：返回（按序号升序的可领取分片列表, 被依赖阻塞的未完成分片数）。
+
+    可领取 = 未完成、无有效租约（过期租约视为空闲）且前置分片全部完成；
+    被阻塞 = 未完成且至少一个前置分片尚未完成（无论该分片当前是否持有有效租约）。
+    """
+    rows = get_conn().execute(
+        "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
+        (session_id,),
+    ).fetchall()
+    completed = {r["chunk_index"] for r in rows if r["status"] == "completed"}
+    deps = load_dependencies(session_id)
+    ready: list[int] = []
+    blocked = 0
+    for row in rows:
+        if row["status"] == "completed":
+            continue
+        chunk_index = row["chunk_index"]
+        if any(d not in completed for d in deps.get(chunk_index, [])):
+            blocked += 1
+        elif not lease_valid(row, now):
+            ready.append(chunk_index)
+    return ready, blocked
+
+
 def conflict(message: str, **extra) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": message, **extra})
 
@@ -134,9 +185,11 @@ def create_session(req: CreateSessionRequest):
     with DB_LOCK:
         conn = get_conn()
         conn.execute(
-            "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status, created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?)",
-            (session_id, req.total_chunks, req.file_digest, req.digest_algorithm, now.isoformat()),
+            "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
+            " max_active_leases, created_at)"
+            " VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            (session_id, req.total_chunks, req.file_digest, req.digest_algorithm,
+             req.max_active_leases, now.isoformat()),
         )
         conn.executemany(
             "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
@@ -153,6 +206,7 @@ def create_session(req: CreateSessionRequest):
         file_digest=req.file_digest,
         digest_algorithm=req.digest_algorithm,
         status="active",
+        max_active_leases=req.max_active_leases,
         created_at=now,
     )
 
@@ -201,6 +255,11 @@ def get_session_status(session_id: str):
         missing_chunks=missing,
         file_digest=session["file_digest"],
         digest_algorithm=session["digest_algorithm"],
+        max_active_leases=session["max_active_leases"],
+        active_leases=sum(
+            1 for c in chunks
+            if c.status == "leased" and c.lease_expires_at is not None
+        ),
         created_at=parse_ts(session["created_at"]),
         finalized_at=parse_ts(session["finalized_at"]) if session["finalized_at"] else None,
         chunks=chunks,
@@ -285,6 +344,15 @@ def claim_lease(
                 "chunk dependencies not completed",
                 missing_dependencies=missing_deps,
             )
+        # 会话级并发上限：已占满槽位（过期租约不计入）时拒绝，避免单片接口绕过批量上限
+        max_active = session["max_active_leases"]
+        active = count_active_leases(session_id, now)
+        if max_active is not None and active >= max_active:
+            return conflict(
+                "session max active leases reached",
+                max_active_leases=max_active,
+                active_leases=active,
+            )
 
         token = secrets.token_urlsafe(32)
         expires_at = now + timedelta(seconds=ttl)
@@ -300,6 +368,69 @@ def claim_lease(
         chunk_index=chunk_index,
         lease_token=token,
         expires_at=expires_at,
+    )
+
+
+@app.post(
+    "/sessions/{session_id}/leases/batch",
+    response_model=BatchLeaseResponse,
+    tags=["leases"],
+    summary="会话级原子批量领取租约（按分片序号，受并发上限约束）",
+)
+def claim_leases_batch(session_id: str, req: BatchLeaseRequest):
+    """一次领取至多 count 个租约：资格计算与写入在同一临界区，保证并发请求不重复分配、
+    不突破 max_active_leases；数量不超过请求值与剩余并发槽位；无可领取项时返回空列表。"""
+    ttl = DEFAULT_LEASE_TTL_SECONDS
+    if req.lease_ttl_seconds is not None:
+        ttl = min(req.lease_ttl_seconds, MAX_LEASE_TTL_SECONDS)
+
+    now = utcnow()
+    with DB_LOCK:
+        session = get_session_or_404(session_id)
+        if session["status"] == "finalized":
+            raise HTTPException(status_code=409, detail="session already finalized")
+
+        # 资格计算与写入均在 DB_LOCK 临界区内：其它领取请求无法穿插看到中间状态
+        ready, blocked = claimable_chunks(session_id, now)
+        max_active = session["max_active_leases"]
+        active = count_active_leases(session_id, now)
+        remaining = None if max_active is None else max(0, max_active - active)
+        quota = req.count if remaining is None else min(req.count, remaining)
+
+        granted: list[BatchLeaseItem] = []
+        if quota > 0:
+            expires_at = now + timedelta(seconds=ttl)
+            conn = get_conn()
+            for chunk_index in ready[:quota]:
+                token = secrets.token_urlsafe(32)
+                conn.execute(
+                    "UPDATE chunks SET status = 'leased', lease_token = ?, lease_expires_at = ?"
+                    " WHERE session_id = ? AND chunk_index = ?",
+                    (token, expires_at.isoformat(), session_id, chunk_index),
+                )
+                granted.append(
+                    BatchLeaseItem(
+                        chunk_index=chunk_index,
+                        lease_token=token,
+                        expires_at=expires_at,
+                    )
+                )
+            conn.commit()
+
+        active_after = active + len(granted)
+        next_expiry = earliest_expiry(session_id)
+
+    return BatchLeaseResponse(
+        session_id=session_id,
+        requested=req.count,
+        granted=granted,
+        active=active_after,
+        blocked=blocked,
+        next_expiry=next_expiry,
+        max_active_leases=max_active,
+        remaining_slots=(
+            None if max_active is None else max(0, max_active - active_after)
+        ),
     )
 
 

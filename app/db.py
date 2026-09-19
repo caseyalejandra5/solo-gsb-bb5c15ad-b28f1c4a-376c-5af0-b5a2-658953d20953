@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     file_digest       TEXT NOT NULL,
     digest_algorithm  TEXT NOT NULL DEFAULT 'sha256',
     status            TEXT NOT NULL DEFAULT 'active',   -- active | finalized
+    max_active_leases INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
     created_at        TEXT NOT NULL,
     finalized_at      TEXT
 );
@@ -49,6 +50,31 @@ CREATE TABLE IF NOT EXISTS chunk_dependencies (
 CREATE INDEX IF NOT EXISTS idx_chunk_deps_session ON chunk_dependencies(session_id);
 """
 
+# 增量迁移：针对早于当前 SCHEMA 创建的旧库，幂等执行（CREATE TABLE IF NOT EXISTS
+# 不会为已存在的表补列，故需显式 ALTER）。
+MIGRATIONS = [
+    # 0001: 会话级并发租约上限；旧库已存在的会话取 NULL，即保持“不限并发”的旧行为
+    (
+        "sessions.max_active_leases",
+        "ALTER TABLE sessions ADD COLUMN max_active_leases INTEGER",
+    ),
+]
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)；
+    # 使用位置下标以兼容未设置 row_factory 的连接。
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def run_migrations(conn: sqlite3.Connection) -> None:
+    with DB_LOCK:
+        for column, ddl in MIGRATIONS:
+            table, _, column_name = column.partition(".")
+            if column_name not in _table_columns(conn, table):
+                conn.execute(ddl)
+        conn.commit()
+
 
 def get_conn() -> sqlite3.Connection:
     """返回进程级共享连接（惰性创建，首次调用时建库建表）。"""
@@ -63,6 +89,7 @@ def get_conn() -> sqlite3.Connection:
         with DB_LOCK:
             _conn.executescript(SCHEMA)
             _conn.commit()
+        run_migrations(_conn)  # 补齐旧库缺失的列
     return _conn
 
 
